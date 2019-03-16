@@ -1,0 +1,215 @@
+---
+title: "Human Activity Recognition Analysis"
+author: "Chiara Todaro"
+date: "12 March 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE)
+```
+<!-- You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases. -->
+
+## Synopsis
+In this report, a Conditional Inference Tree Classification algorithm is performed 
+on data recorded from accelerometers worn by participants performing physical activity. 
+The in-sample accuracy is 94%, while the estimated out-sample accuracy is ~91%. 
+The probability of correct prediction on 20 new samples is 0.95 
+on average, with a standard deviation of 0.13. 
+
+## Analysis
+The Conditional Inference Tree Classification algorithm has been chosen because 
+it reaches a good trade-off between accuracy and computational cost (for a complete 
+description of the method see Hothorn, Hornik and Zeileis (2006)[^1]). 
+Briefly, this algorithm works like a classification tree in which the variable selection 
+and the subsequent splitting procedure is ruled by $\chi^2$ hypothesis tests between 
+a nominal response and one of the covariates: the one with the highest association 
+is selected for splitting.
+The entire analysis has been performed in R, and the implementation of the Conditional 
+Inference Tree Classification algorithm is taken from the package [*party*](https://cran.r-project.org/web/packages/party/party.pdf).
+
+[^1]: Torsten Hothorn, Kurt Hornik and Achim Zeileis (2006). Unbiased Recursive Partitioning: 
+A Conditional Inference Framework. Journal of Computational and Graphical Statistics, 15(3), 651–674. 
+[Preprint.pdf](http://statmath.wu-wien.ac.at/~zeileis/papers/Hothorn+Hornik+Zeileis-2006.pdf)
+
+### Data loading and cleaning
+```{r load_data,message=FALSE}
+rm(list = ls());setwd("~/coursera/course8_Practical_Machine_Learning");
+library(dplyr);library(caret);library(gridExtra);library(party)
+library(gtools);library(ggpubr)
+
+training<-read.csv("./data_exercises/pml-training.csv");
+testing<-read.csv("./data_exercises/pml-testing.csv");
+```
+
+Data are taken from the Human Activity Recognition [database](http://groupware.les.inf.puc-rio.br/har) 
+and consist in the recordings by accelerometers worn by six participants 
+performing 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: 
+
+ * *A* exactly according to the specification, 
+ * *B* throwing the elbows to the front, 
+ * *C* lifting the dumbbell only halfway, 
+ * *D* lowering the dumbbell only halfway
+ * *E* throwing the hips to the front.
+
+The goal of the experiment is to predict the way in which a participant performed the exercise. 
+For more information on data acquisition and original analysis see Ugolino et. al (2012)[^2].
+
+[^2]:Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. 
+Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. 
+Proceedings of 21st Brazilian Symposium on Artificial Intelligence. 
+Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , 
+pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6. 
+
+```{r clean_data}
+training[training==""] <- NA
+indNAs<-is.na(training); # 0.41  # 0.6120681
+countsNAs<-apply(indNAs,2,sum)
+
+training<-training[,countsNAs==0]
+testing<-testing[,countsNAs==0]
+```
+
+Since `r mean(indNAs)*100`% of the total elements are *NA*, only `r sum(countsNAs==0)` out of 
+`r length(countsNAs)` variables are kept, for both the training and testing set.
+The training and testing set have `r nrow(training)` and `r nrow(testing)` observations, respectively.
+
+### Exploratory analysis
+The remaining variables consist of measures, e.g. roll, pitch, yaw, total acceleration, 
+acceleration, gyros, magnet, taken from different body parts, e.g. belt, arm, dumbbell, and forearm. 
+As an example, Figure 1 shows the roll of all body parts for each participant: 
+the recorded signals are coloured accordingly to the variable "*classe*" which 
+represent the type of movement to predict. 
+For example, it can be seen that for the belt the signals related to class *A* 
+are more discernable from the other type of exercise.
+
+```{r exploratory_analysis,fig.width=10.0,fig.height=6,fig.align="center",fig.cap ="Raw data: roll signals"}
+dataExpl<-training;
+dataExpl<-mutate(dataExpl,user_name=factor(user_name),classe=factor(classe))
+
+p1exp<-ggplot(aes(x=raw_timestamp_part_2,y=roll_belt,color=classe),data=dataExpl)
+p1exp<-p1exp+geom_line()+facet_grid(user_name~.) #+theme(legend.position = "none") 
+p2exp<-ggplot(aes(x=raw_timestamp_part_2,y=roll_arm,color=classe),data=dataExpl)
+p2exp<-p2exp+geom_line()+facet_grid(user_name~.)#+theme(legend.position = "none") 
+p3exp<-ggplot(aes(x=raw_timestamp_part_2,y=roll_dumbbell,color=classe),data=dataExpl)
+p3exp<-p3exp+geom_line()+facet_grid(user_name~.)#+theme(legend.position = "none") 
+p4exp<-ggplot(aes(x=raw_timestamp_part_2,y=roll_forearm,color=classe),data=dataExpl)
+p4exp<-p4exp+geom_line()+facet_grid(user_name~.)#+theme(legend.position = c(1.0,0.5))
+
+ggarrange(p1exp,p2exp,p3exp,p4exp,ncol=4, common.legend = TRUE, legend="bottom") #
+```
+
+### Cross-validation
+```{r cross_validation,collapse=TRUE,results="hide"}
+beltVar<-grepl("_belt",names(training));sum(beltVar); # 22 #,value=TRUE 13
+armVar<-grepl("_arm",names(training));sum(armVar); #19 13
+dumbbellVar<-grepl("_dumbbell",names(training));sum(dumbbellVar); #22 13
+forearmVar<-grepl("_forearm",names(training));sum(forearmVar); #22 13
+sum(c(beltVar,armVar,dumbbellVar,forearmVar)) # 85, 52
+
+numericVar<-beltVar+armVar+dumbbellVar+forearmVar
+yind<-rep(0,each=ncol(dataExpl));yind[ncol(dataExpl)]<-1;
+variables<-rbind(beltVar,armVar,dumbbellVar,forearmVar)
+combinations<-permutations(n=2,r=4,v=c(0,1),repeats.allowed=T);combinations<-combinations[-1,]
+
+set.seed(1546);
+foldsCV<-createFolds(y=dataExpl$classe,k=nrow(combinations),list = TRUE,returnTrain = TRUE)
+
+accuracyCV<-data.frame(comb=combinations,accuracyTrain=rep(0,length=nrow(combinations)),
+                       accuracyTest=rep(0,length=nrow(combinations)))
+for (i in seq(nrow(combinations))){ #
+   selection<-colSums(combinations[i,]*variables+yind)
+   dataFit<-dataExpl[,as.logical(selection)]
+   # print(names(dataFit))
+   dataCV<-dataFit[foldsCV[[i]],]
+   set.seed(i*32)
+   fitTREE <- ctree(classe ~ ., data = dataCV,controls = ctree_control(maxsurrogate = 3))
+   predTREE<-predict(fitTREE,dataCV)
+   accuracyCV$accuracyTrain[i]<-(mean(predTREE==dataCV$classe))*100 # [1] 0.9505147
+   predTREE<-predict(fitTREE,dataFit[-foldsCV[[i]],])
+   accuracyCV$accuracyTest[i]<-(mean(predTREE==dataFit[-foldsCV[[i]],]$classe))*100 # [1] 0.9505147
+}
+```
+
+Cross-validation is performed by splitting into k-folds (k=15) the training set. 
+Subsets of features are choosen combining variables relative to different body parts.
+In the table shown below the presence of features relative to a specific body part is 
+represented by "1", while the absence is represented by "0". For each selection the 
+in-sample accuracy (*accuracyTrain*) and out-sample accuracy (*accuracyTest*) are 
+reported.
+
+```{r cross_validation_accuracy}
+#dim(combinations);dim(accuracyCV)
+names(accuracyCV)[1:4]<-c("belt","arm","dumbell","forearm");accuracyCV
+```
+
+The most accurate prediction is obtained combining all variables (row 15) with in-sample and 
+out-sample accuracy of `r accuracyCV[15,5]*100`% and `r accuracyCV[15,6]*100`%, respectively.
+Since in the cross-validation procedure the out-sample accuracy is 
+`r accuracyCV[15,5]*100-accuracyCV[15,6]*100`% lower than the in-sample accuracy, similar 
+performances are expected in the testing set.
+
+### Training set accuracy
+The percentages of predictions (rows) vs the actual *classe* (columns) are shown below.
+
+```{r training_analysis}
+selection<-colSums(combinations[nrow(combinations),]*variables+yind)
+dataFit<-dataExpl[,as.logical(selection)]
+set.seed(1627)
+fitTREE <- ctree(classe ~ ., data = dataFit,controls = ctree_control(maxsurrogate = 3))
+predTREE<-predict(fitTREE,dataFit)
+100*(table(predTREE,dataFit$classe)/sum(table(dataFit$classe)))
+# predTREE            A            B            C            D            E
+#         A 0.2761696055 0.0055549893 0.0011721537 0.0025991234 0.0007644481
+#         B 0.0047905412 0.1781164000 0.0063704006 0.0030068291 0.0031597187
+#         C 0.0009173377 0.0044847620 0.1630312914 0.0058607685 0.0020385282
+#         D 0.0019875650 0.0029049027 0.0025991234 0.1509530119 0.0020385282
+#         E 0.0005096320 0.0024462338 0.0012231169 0.0014779329 0.1758230558
+# mean(predTREE==dataFit$classe) # [1] 0.9440934
+predProb<-predict(fitTREE,dataFit,type="prob")
+# hist(unlist(predProb),breaks = 4)
+# plot(fitTREE) # useless, too confused
+# treeresponse(fitTREE)?
+# mean(as.numeric(lapply(predProb,max))) #[1] 0.9440934
+# sd(as.numeric(lapply(predProb,max))) #[1] 0.1208337
+
+```
+
+The in-sample accuracy of the whole training set is `r mean(predTREE==dataFit$classe)*100`% and 
+the average probability of correct prediction is `r mean(as.numeric(lapply(predProb,max)))` with 
+standard deviation of `r sd(as.numeric(lapply(predProb,max)))`.
+The expected out-sample accuracy is around 
+`r abs(mean(predTREE==dataFit$classe)*100-accuracyCV[15,5]*100-accuracyCV[15,6]*100)`%.
+
+### Prediction of testing set
+```{r testing_analysis}
+testFit<-select(testing,-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,
+                           cvtd_timestamp,new_window,num_window,problem_id))
+testFit<-mutate(testFit,classe=factor(rep("NA",length=nrow(testing))),
+                magnet_dumbbell_z=as.numeric(magnet_dumbbell_z),
+                magnet_forearm_y=as.numeric(magnet_forearm_y),
+                magnet_forearm_z=as.numeric(magnet_forearm_z))
+predTREEtest<-Predict(fitTREE,newdata=testFit)
+#[1] B A B A A E C E A A B C B A E E A B B B
+# mean(predTREEtest==predTREEBAGtest) #[1] 0.9
+probPredTest<-predict(fitTREE,testFit,type="prob",list=FALSE)
+# indMax<-as.numeric(predTREEtest); #cbind(,seq(length(probPredTest)))
+M<-matrix(rep(NA,100),nrow = 20)
+for (i in seq(length(probPredTest))){
+ M[i,]<-probPredTest[[i]]
+#  indMax<-as.numeric(predTREEtest)
+}
+# apply(M,1,which.max)==indMax
+# mean(apply(M,1,max)) #[1] 0.9428752
+# sd(apply(M,1,max)) #[1]  0.1298373
+```
+The predictions on the test data set are 
+
+`r predTREEtest` 
+
+with probability of correct prediction of 
+
+`r apply(M,1,max)`
+
+As expected, only `r mean(apply(M,1,max)>0.9)*100`% of the predictions are 
+likely to be correct.
